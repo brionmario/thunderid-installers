@@ -4,11 +4,27 @@ import * as https from 'https';
 import * as os from 'os';
 import * as path from 'path';
 import type { IncomingMessage } from 'http';
-
-const THUNDER_REPO = 'thunder-id/thunderid';
+import ThunderRepo from './constants';
 
 const PLATFORM_MAP: Record<string, string> = { darwin: 'macos', linux: 'linux', win32: 'win' };
 const ARCH_MAP: Record<string, string> = { x64: 'x64', arm64: 'arm64' };
+const RELEASES_URL = `https://${ThunderRepo.DOMAIN}/data/releases.json`;
+
+interface ReleaseAsset {
+  name: string;
+  downloadUrl: string;
+}
+
+interface Release {
+  tagName: string;
+  isLatest: boolean;
+  assets: ReleaseAsset[];
+}
+
+interface ReleasesData {
+  latestRelease: Release;
+  releases: Release[];
+}
 
 export function getPlatformAsset(version: string): string {
   const platform = PLATFORM_MAP[process.platform];
@@ -16,7 +32,7 @@ export function getPlatformAsset(version: string): string {
   if (!platform || !arch) {
     throw new Error(`Unsupported platform: ${process.platform}/${process.arch}`);
   }
-  return `thunderid-${version}-${platform}-${arch}.zip`;
+  return `${ThunderRepo.HANDLE}-${version}-${platform}-${arch}.zip`;
 }
 
 function fetchWithRedirects(url: string): Promise<IncomingMessage> {
@@ -31,6 +47,41 @@ function fetchWithRedirects(url: string): Promise<IncomingMessage> {
       resolve(res);
     }).on('error', reject);
   });
+}
+
+function fetchJson<T>(url: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    https.get(url, { headers: { 'User-Agent': 'thunderid-npx' } }, (res) => {
+      if (res.statusCode === 301 || res.statusCode === 302) {
+        return fetchJson<T>(res.headers.location as string).then(resolve).catch(reject);
+      }
+      if (res.statusCode !== 200) {
+        return reject(new Error(`HTTP ${res.statusCode} for ${url}`));
+      }
+      let body = '';
+      res.on('data', (chunk: string) => { body += chunk; });
+      res.on('end', () => {
+        try { resolve(JSON.parse(body) as T); } catch (err) { reject(err); }
+      });
+    }).on('error', reject);
+  });
+}
+
+async function fetchReleasesData(): Promise<ReleasesData> {
+  try {
+    return await fetchJson<ReleasesData>(RELEASES_URL);
+  } catch {
+    // Fallback: reconstruct ReleasesData shape from GitHub API
+    const ghUrl = `https://api.github.com/repos/${ThunderRepo.REPO}/releases/latest`;
+    const gh = await fetchJson<{ tag_name?: string; assets?: Array<{ name: string; browser_download_url: string }> }>(ghUrl);
+    if (!gh.tag_name) throw new Error('tag_name missing from GitHub release response');
+    const release: Release = {
+      tagName: gh.tag_name,
+      isLatest: true,
+      assets: (gh.assets ?? []).map(a => ({ name: a.name, downloadUrl: a.browser_download_url })),
+    };
+    return { latestRelease: release, releases: [release] };
+  }
 }
 
 async function downloadFile(
@@ -72,11 +123,18 @@ export async function downloadAndExtract(
   onStatus?: (msg: string) => void,
 ): Promise<void> {
   const assetName = getPlatformAsset(version);
-  const url = `https://github.com/${THUNDER_REPO}/releases/download/v${version}/${assetName}`;
+
+  const data = await fetchReleasesData();
+  const release = data.releases.find(r => r.tagName === `v${version}`) ?? data.latestRelease;
+  const asset = release.assets.find(a => a.name === assetName);
+  if (!asset) {
+    throw new Error(`No release asset found for ${assetName}`);
+  }
+
   const zipPath = path.join(os.tmpdir(), assetName);
 
   onStatus?.(`Downloading Thunder v${version} for ${process.platform}/${process.arch}`);
-  await downloadFile(url, zipPath, (received, total) => {
+  await downloadFile(asset.downloadUrl, zipPath, (received, total) => {
     const pct = Math.round((received / total) * 100);
     onStatus?.(`Downloading Thunder v${version} — ${pct}%`);
   });
@@ -87,27 +145,9 @@ export async function downloadAndExtract(
   try { fs.unlinkSync(zipPath); } catch { /* ignore */ }
 }
 
-export function getLatestThunderVersion(): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const url = `https://api.github.com/repos/${THUNDER_REPO}/releases/latest`;
-    https.get(url, { headers: { 'User-Agent': 'thunderid-npx' } }, (res) => {
-      if (res.statusCode === 301 || res.statusCode === 302) {
-        return getLatestThunderVersion().then(resolve).catch(reject);
-      }
-      if (res.statusCode !== 200) {
-        return reject(new Error(`HTTP ${res.statusCode} fetching latest Thunder release`));
-      }
-      let body = '';
-      res.on('data', (chunk: string) => { body += chunk; });
-      res.on('end', () => {
-        try {
-          const tag = (JSON.parse(body) as { tag_name?: string }).tag_name;
-          if (!tag) throw new Error('tag_name missing from GitHub release response');
-          resolve(tag.replace(/^v/, ''));
-        } catch (err) {
-          reject(err);
-        }
-      });
-    }).on('error', reject);
-  });
+export async function getLatestThunderVersion(): Promise<string> {
+  const data = await fetchReleasesData();
+  const tag = data.latestRelease.tagName;
+  if (!tag) throw new Error('tagName missing from releases data');
+  return tag.replace(/^v/, '');
 }
